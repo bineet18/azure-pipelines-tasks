@@ -88,6 +88,90 @@ export function separatePlaywrightTestName(inputString) {
     }
 }
 
+export interface PlaywrightResolvedTests {
+    locations: string[];
+    unmatched: string[];
+}
+
+/*
+    Resolves stored automated test names to exact Playwright test locations
+    ("file:line") using the report produced by `playwright test --list --reporter=json`.
+
+    Two stored-name formats are supported:
+    1. Names captured by result-based association from the pipeline Tests tab,
+       which are '›'-joined title paths, e.g.
+       "sample.spec.ts › Suite name › test title" or "Suite name › test title".
+       These are matched exactly (part by part) against the tail of each spec's
+       full title path, so a title that is a prefix of another title can never
+       over-match.
+    2. Manually entered names in the "<path>.<test title>" form, e.g.
+       "tests/sample.spec.ts.test title". The segment after the last dot is
+       matched exactly against the spec title.
+    As a backward-compatible fallback, a name that matches nothing exactly is
+    matched with the previous behavior (substring of the space-joined title
+    path, after last-dot truncation), so existing setups keep working.
+*/
+export function resolvePlaywrightTestLocations(listReport: any, automatedTestNames: string[]): PlaywrightResolvedTests {
+    interface FlatSpec { titlePath: string[]; file: string; line: number; }
+    const flatSpecs: FlatSpec[] = [];
+
+    const walk = (suite: any, ancestors: string[]) => {
+        const titlePath = suite && suite.title ? ancestors.concat([suite.title]) : ancestors;
+        for (const spec of (suite && suite.specs) || []) {
+            flatSpecs.push({ titlePath: titlePath.concat([spec.title]), file: spec.file, line: spec.line });
+        }
+        for (const child of (suite && suite.suites) || []) {
+            walk(child, titlePath);
+        }
+    };
+    for (const suite of (listReport && listReport.suites) || []) {
+        walk(suite, []);
+    }
+
+    const locations = new Set<string>();
+    const unmatched: string[] = [];
+
+    for (const storedName of automatedTestNames) {
+        let matches: FlatSpec[] = [];
+
+        const parts = storedName.split('›').map((p: string) => p.trim()).filter((p: string) => p.length > 0);
+        if (parts.length > 1) {
+            // '›'-joined name from result-based association: exact tail match.
+            matches = flatSpecs.filter(s => {
+                if (parts.length > s.titlePath.length) {
+                    return false;
+                }
+                const tail = s.titlePath.slice(s.titlePath.length - parts.length);
+                return tail.every((t, i) => t === parts[i]);
+            });
+        } else {
+            // "<path>.<test title>" form, or a bare title: exact leaf-title match.
+            const leafTitle = separatePlaywrightTestName(storedName);
+            matches = flatSpecs.filter(s => {
+                const specTitle = s.titlePath[s.titlePath.length - 1];
+                return specTitle === storedName || specTitle === leafTitle;
+            });
+        }
+
+        if (matches.length === 0) {
+            // Legacy fallback: previous substring behavior against the
+            // space-joined title path.
+            const legacyName = separatePlaywrightTestName(storedName);
+            matches = flatSpecs.filter(s => s.titlePath.join(' ').includes(legacyName));
+        }
+
+        if (matches.length === 0) {
+            unmatched.push(storedName);
+            continue;
+        }
+        for (const m of matches) {
+            locations.add(`${m.file}:${m.line}`);
+        }
+    }
+
+    return { locations: Array.from(locations), unmatched: unmatched };
+}
+
 export function getExecOptions(output?: { stdout: string }): tr.IExecOptions {
     const env = process.env;
 

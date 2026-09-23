@@ -78,8 +78,10 @@ export class PlaywrightTestExecutor implements ITestExecutor {
     async discoverTests(listOfTestsToBeExecuted: string[], ciData: ciDictionary, listOfTestsToBeRan: string[]): Promise<IOperationResult> {
         let operationResult: IOperationResult = { returnCode: 0, errorMessage: '' };
 
+        // Stored automated test names are resolved to exact test locations in
+        // executeTests, so they are passed through unchanged here.
         listOfTestsToBeExecuted.forEach(test => {
-            listOfTestsToBeRan.push(utils.separatePlaywrightTestName ? utils.separatePlaywrightTestName(test) : test);
+            listOfTestsToBeRan.push(test);
         });
 
         return operationResult;
@@ -99,7 +101,7 @@ export class PlaywrightTestExecutor implements ITestExecutor {
             };
         }
 
-        let grepArg = '';
+        let resolvedLocations: string[] = [];
         try {
             const junitOutput = 'test-results/test-results.xml';
             tl.setVariable('PLAYWRIGHT_JUNIT_OUTPUT_NAME', junitOutput);
@@ -108,18 +110,44 @@ export class PlaywrightTestExecutor implements ITestExecutor {
                 fs.mkdirSync(resultsDir);
             }
 
-            // Playwright test name selection usually uses 'grep'
-            const grepPattern = testsToBeExecuted.map(t => utils.escapeRegex(t)).join('|');
-            grepArg = grepPattern;
+            // 1. List all tests as JSON to resolve stored automated test names
+            // to exact "file:line" locations. The report is written to a file
+            // (PLAYWRIGHT_JSON_OUTPUT_NAME) instead of being read from stdout,
+            // because config/global-setup output (e.g. dotenv banners) would
+            // corrupt the JSON on stdout.
+            const listReportFile = path.join(resultsDir, 'playwright-list-report.json');
+            this.toolRunnerPath = tl.which(constants.NPX_EXECUTABLE, true);
+            this.toolRunner = tl.tool(this.toolRunnerPath);
+            this.toolRunner.arg('cross-env');
+            this.toolRunner.arg(`PLAYWRIGHT_JSON_OUTPUT_NAME=${listReportFile}`);
+            this.toolRunner.arg('playwright');
+            this.toolRunner.arg('test');
+            this.toolRunner.arg('--list');
+            this.toolRunner.arg('--reporter=json');
 
-            tl.debug(`Grep Argument: ${grepArg}`);
+            const listReturnCode = await this.toolRunner.execAsync();
+            if (listReturnCode !== 0 || !fs.existsSync(listReportFile)) {
+                throw new Error(`Failed to list Playwright tests (exit code ${listReturnCode})`);
+            }
+
+            const listReport = JSON.parse(fs.readFileSync(listReportFile, 'utf8'));
+            const resolved = utils.resolvePlaywrightTestLocations(listReport, testsToBeExecuted);
+            resolvedLocations = resolved.locations;
+
+            for (const name of resolved.unmatched) {
+                tl.warning(`No Playwright test matched the automated test name: ${name}`);
+            }
+            tl.debug(`Resolved ${resolvedLocations.length} test location(s): ${JSON.stringify(resolvedLocations)}`);
+
+            if (resolvedLocations.length === 0) {
+                throw new Error('None of the selected test points matched a Playwright test');
+            }
 
             executionTimer.start();
 
-            const commandPreview = `npx cross-env PLAYWRIGHT_JUNIT_OUTPUT_NAME=${junitOutput} playwright test --reporter=junit -g "${grepArg}"`;
-            tl.debug(`Executing Playwright test command: ${commandPreview}`);
-
-            // Building the command: npx cross-env PLAYWRIGHT_JUNIT_OUTPUT_NAME=... playwright test --reporter=junit -g ...
+            // 2. Run exactly the resolved tests by location:
+            // npx cross-env PLAYWRIGHT_JUNIT_OUTPUT_NAME=... playwright test --reporter=junit <file:line> ...
+            tl.debug(`Executing Playwright test command: npx cross-env PLAYWRIGHT_JUNIT_OUTPUT_NAME=${junitOutput} playwright test --reporter=junit ${resolvedLocations.join(' ')}`);
             this.toolRunnerPath = tl.which(constants.NPX_EXECUTABLE, true);
             this.toolRunner = tl.tool(this.toolRunnerPath);
 
@@ -128,8 +156,9 @@ export class PlaywrightTestExecutor implements ITestExecutor {
             this.toolRunner.arg('playwright');
             this.toolRunner.arg('test');
             this.toolRunner.arg('--reporter=junit');
-            this.toolRunner.arg('-g');
-            this.toolRunner.arg(grepArg);
+            for (const location of resolvedLocations) {
+                this.toolRunner.arg(location);
+            }
 
             operationResult.returnCode = await this.toolRunner.execAsync();
 
@@ -145,7 +174,7 @@ export class PlaywrightTestExecutor implements ITestExecutor {
         }
 
         executionTimer.stop(ciData);
-        ciData['grepArgument'] = grepArg;
+        ciData['resolvedTestLocations'] = resolvedLocations.join('|');
         ciData['executionStatus'] = operationResult.returnCode === 0 ? 'Success' : 'Failure';
 
         return operationResult;
